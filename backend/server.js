@@ -1,57 +1,88 @@
-const WebSocket = require('ws');
-const express = require('express');
-const http = require('http');
-// SerialPort and parser will be required dynamically inside tryInitSerial()
+/**
+ * ============================================================================
+ * NEO-6M GPS Backend Server
+ * ============================================================================
+ * Reads GPS data from Arduino NEO-6M module via serial port and broadcasts
+ * real-time updates to connected clients over WebSocket.
+ * 
+ * Features:
+ * - Serial port communication with Arduino
+ * - NMEA GPS sentence parsing (GPGGA, GPRMC)
+ * - Labeled key-value GPS data parsing
+ * - WebSocket server for real-time client updates
+ * - Auto-reconnection with mock data fallback
+ * - Health check endpoints for monitoring
+ * ============================================================================
+ */
+
+// ============== IMPORTS & DEPENDENCIES ==============
+const WebSocket = require('ws');           // WebSocket server for real-time communication
+const express = require('express');        // Express.js framework for HTTP endpoints
+const http = require('http');              // HTTP server to attach WebSocket to
+const cors = require('cors');              // CORS middleware for cross-origin requests
+const GPSData = require('./gpsModel');     // MongoDB GPS data model (stub)
+
+// SerialPort modules loaded dynamically to allow server to run without hardware
 let SerialPort = null;
 let ReadlineParser = null;
 
-const cors = require('cors');
-const GPSData = require('./gpsModel');
+// ============== ENVIRONMENT & CONFIGURATION ==============
+require('dotenv').config(); // Load environment variables from .env file
 
+// ============== EXPRESS SERVER SETUP ==============
 const app = express();
-app.use(cors());
+app.use(cors()); // Enable CORS for all routes
 
-// Load environment variables (no DB connection)
-require('dotenv').config();
-
-// Ensure explicit CORS response for health and preflight in case middleware is skipped
+// Custom CORS middleware for explicit header handling
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS,PUT,DELETE');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  // Handle preflight requests
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
   }
   next();
 });
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+
+// ============== HTTP & WEBSOCKET SERVER ==============
+const server = http.createServer(app);     // Create HTTP server
+const wss = new WebSocket.Server({ server }); // Attach WebSocket server to HTTP
 
 console.log('🚀 WebSocket server attached to http server');
 
+// Handle HTTP server errors
 server.on('error', (err) => {
   console.error('HTTP server error:', err && err.stack ? err.stack : err);
 });
-// Simple health endpoint so clients can check server readiness
+// ============== HTTP ENDPOINTS ==============
+
+/**
+ * GET /health
+ * Health check endpoint for clients to verify server is running and ready
+ * Returns: { status: 'ok' }
+ */
 app.get('/health', (req, res) => {
-  // Log the health check so we can see which process handled it
   try {
     const remote = req.ip || req.headers['x-forwarded-for'] || (req.connection && req.connection.remoteAddress) || 'unknown';
     console.log(`/health requested from ${remote}`);
   } catch (e) {}
 
-  // Explicitly set CORS header so browsers always see it
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.status(200).json({ status: 'ok' });
 });
 
-// Disconnect endpoint to close Arduino connection
+/**
+ * POST /disconnect
+ * Closes the serial port connection and all active WebSocket clients
+ * Used when user wants to stop GPS tracking
+ */
 app.post('/disconnect', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   try {
     console.log('🔴 Disconnect request received');
     
-    // Close serial port if open
+    // Close serial port if it's currently open
     if (port && port.isOpen) {
       port.close((err) => {
         if (err) {
@@ -62,7 +93,7 @@ app.post('/disconnect', (req, res) => {
       });
     }
     
-    // Close WebSocket connections
+    // Close all active WebSocket connections
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
         client.close(1000, 'Server disconnect requested');
@@ -77,17 +108,20 @@ app.post('/disconnect', (req, res) => {
   }
 });
 
-// Connect endpoint to start Arduino connection
+/**
+ * POST /connect
+ * Reconnects to Arduino serial port and resumes GPS data broadcasting
+ * Used when user wants to resume GPS tracking
+ */
 app.post('/connect', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   try {
     console.log('🟢 Connect request received');
     
-    // Reinitialize serial port
+    // Attempt to initialize serial port connection
     const parser = await tryInitSerial();
     if (parser) {
       console.log('✅ Serial port reconnected successfully');
-      // Set up the parser with the new connection
       setupSerialParser(parser);
       res.status(200).json({ status: 'connected', message: 'Arduino connected successfully' });
     } else {
@@ -100,24 +134,37 @@ app.post('/connect', async (req, res) => {
   }
 });
 
-// Serial port config (can be overridden with env var SERIAL_PORT)
-const PREFERRED_PORT = process.env.SERIAL_PORT || 'COM3';
-const BAUD_RATE = parseInt(process.env.BAUD_RATE, 10) || 9600;
+// ============== SERIAL PORT CONFIGURATION ==============
+const PREFERRED_PORT = process.env.SERIAL_PORT || 'COM3';  // Default: COM3 (Windows)
+const BAUD_RATE = parseInt(process.env.BAUD_RATE, 10) || 9600; // Default: 9600
 
-let parser = null;
-let port = null; // global serial port reference so /disconnect can close it
-let mockInterval = null;
-let lastBroadcastJson = null;
-let lastRawInput = null; // Track last raw input to deduplicate
+// ============== GLOBAL VARIABLES ==============
+let parser = null;                  // Current serial port parser instance
+let port = null;                    // Reference to open serial port
+let mockInterval = null;            // Interval for mock GPS data generation
+let lastBroadcastJson = null;       // Last broadcast JSON to detect duplicates
+let lastRawInput = null;            // Last raw input line to skip duplicates
 
+/**
+ * ============================================================================
+ * SERIAL PORT INITIALIZATION
+ * ============================================================================
+ * Attempts to initialize connection to Arduino via serial port
+ * - Loads serialport libraries dynamically
+ * - Lists available serial ports
+ * - Connects to preferred port or first available
+ * - Sets up readline parser to read GPS data line-by-line
+ * 
+ * Returns: parser object if successful, null if failed (will use mock data)
+ */
 async function tryInitSerial() {
-  // Allow skipping serial initialization for development/testing by setting SKIP_SERIAL=1
+  // Allow skipping serial for development/testing
   if (process.env.SKIP_SERIAL === '1') {
     console.log('SKIP_SERIAL is set; skipping serial port initialization.');
     return null;
   }
   try {
-    // Dynamically require serialport so the server can run even if native modules aren't installed
+    // Dynamically require serialport modules (allows app to run without native modules)
     try {
       const sp = require('serialport');
       SerialPort = sp.SerialPort || sp;
@@ -126,10 +173,11 @@ async function tryInitSerial() {
       return null;
     }
 
+    // Load readline parser for parsing line-delimited GPS data
     try {
       ReadlineParser = require('@serialport/parser-readline').ReadlineParser;
     } catch (e) {
-      // older parser export may be the function directly
+      // Try fallback for older versions
       try {
         ReadlineParser = require('@serialport/parser-readline');
       } catch (e2) {
@@ -187,47 +235,28 @@ async function tryInitSerial() {
     return null;
   }
 }
-// Save GPS data to MongoDB with TTL auto-delete
-async function saveGPSDataToDB(gpsData) {
-  try {
-    if (!gpsData || gpsData.source === 'raw') return;
-    
-    // No DB configured: the GPS model is a no-op stub so saving is harmless.
-    
-    // Check if collection has reached 45 records
-    const count = await GPSData.countDocuments();
-    if (count >= 45) {
-      await GPSData.deleteMany({});
-      console.log('🔄 Collection reached 45 records, cleared all. Restarting...');
-    }
-    
-    const gpsRecord = new GPSData({
-      latitude: gpsData.latitude,
-      longitude: gpsData.longitude,
-      altitude: gpsData.altitude,
-      satellites: gpsData.satellites,
-      hdop: gpsData.hdop,
-      speed: gpsData.speed,
-      course: gpsData.course,
-      date: gpsData.date,
-      time: gpsData.time,
-      fix: gpsData.fix,
-      source: gpsData.source
-    });
-    
-    //   await gpsRecord.save();
-    //   console.log('📦 GPS saved to DB (auto-deletes in 1 minute)');
-  } catch (err) {
-    console.error('❌ Error saving GPS data to DB:', err.message);
-  }
-}
 
+
+/**
+ * ============================================================================
+ * BROADCAST TO CONNECTED CLIENTS
+ * ============================================================================
+ * Sends GPS data to all connected WebSocket clients
+ * Features:
+ * - Filters out raw/noise data (source === 'raw')
+ * - Deduplicates identical consecutive messages
+ * - Logs all broadcasts with message preview
+ * - Counts recipients for monitoring
+ */
 function broadcastToClients(obj) {
   if (!obj) return;
-  // Do not broadcast raw/noise lines to clients
+  
+  // Don't broadcast raw noise lines to clients
   if (obj.source === 'raw') return;
+  
   const msg = JSON.stringify(obj);
-  // Deduplicate identical consecutive broadcasts to reduce noise
+  
+  // Skip if this is identical to the last broadcast (reduce noise)
   if (msg === lastBroadcastJson) {
     console.log('[BROADCAST] Skipped duplicate');
     return;
@@ -242,24 +271,35 @@ function broadcastToClients(obj) {
     }
   });
   console.log(`   Sent to ${sentCount} client(s)`);
-  // Save GPS data to MongoDB with auto-delete after 1 minute
-  saveGPSDataToDB(obj);
 }
 
-// Compute approximate local time and timezone offset from longitude
+/**
+ * ============================================================================
+ * COMPUTE LOCAL TIME FROM LONGITUDE
+ * ============================================================================
+ * Calculates approximate local time and timezone offset based on GPS longitude
+ * Formula: timezone offset = longitude / 15 degrees per hour
+ * 
+ * Parameters:
+ * - latitude, longitude: GPS coordinates (for timezone calculation)
+ * - dateIso: Date string in format YYYY-MM-DD
+ * - timeStr: Time string in format HH:MM:SS
+ * 
+ * Returns: { localTime: formatted string, tzOffset: UTC offset string }
+ */
 function computeLocalTimeFromLon(latitude, longitude, dateIso, timeStr) {
-  // longitude in degrees, timezone offset hours = lon/15
+  // Calculate timezone offset: each 15 degrees of longitude = 1 hour
   const lon = parseFloat(longitude);
   if (isNaN(lon)) return { localTime: null, tzOffset: null };
 
-  const offsetHours = lon / 15.0; // can be fractional (e.g., India ~5.5)
+  const offsetHours = lon / 15.0; // Can be fractional (e.g., India ~5.5)
   const offsetMinutes = Math.round(offsetHours * 60);
 
-  // Build a Date in UTC from provided dateIso (YYYY-MM-DD) and timeStr (HH:MM:SS)
+  // Build a Date object in UTC from provided date and time
   let utcDate = null;
   try {
     if (dateIso && timeStr) {
-      // ensure timeStr is HH:MM:SS
+      // Ensure time is formatted HH:MM:SS
       const t = timeStr.split(':').slice(0,3).map(s => s.padStart(2,'0')).join(':');
       utcDate = new Date(`${dateIso}T${t}Z`);
       if (isNaN(utcDate.getTime())) utcDate = null;
@@ -268,17 +308,19 @@ function computeLocalTimeFromLon(latitude, longitude, dateIso, timeStr) {
     utcDate = null;
   }
 
-  if (!utcDate) utcDate = new Date(); // fallback to now UTC
+  // Fallback to current UTC time if parsing failed
+  if (!utcDate) utcDate = new Date();
 
   // Apply offset minutes to get local time
   const localMs = utcDate.getTime() + offsetMinutes * 60 * 1000;
   const localDate = new Date(localMs);
 
-  // Format local time as YYYY-MM-DD and HH:MM:SS
+  // Format local time as YYYY-MM-DD HH:MM:SS
   const pad = (n) => String(n).padStart(2, '0');
   const localDateIso = `${localDate.getUTCFullYear()}-${pad(localDate.getUTCMonth()+1)}-${pad(localDate.getUTCDate())}`;
   const localTimeStr = `${pad(localDate.getUTCHours())}:${pad(localDate.getUTCMinutes())}:${pad(localDate.getUTCSeconds())}`;
 
+  // Format timezone offset as UTC±HH:MM
   const tzSign = offsetMinutes >= 0 ? '+' : '-';
   const tzAbs = Math.abs(offsetMinutes);
   const tzH = Math.floor(tzAbs / 60);
@@ -288,60 +330,112 @@ function computeLocalTimeFromLon(latitude, longitude, dateIso, timeStr) {
   return { localTime: `${localDateIso} ${localTimeStr}`, tzOffset: tzOffsetStr };
 }
 
-// When a client connects, if we have a serial parser, hook it up for that client
+/**
+ * ============================================================================
+ * WEBSOCKET CONNECTION HANDLER
+ * ============================================================================
+ * Handles new WebSocket client connections
+ * - Sets up GPS data stream for each client
+ * - Attaches serial parser listener for real-time data
+ * - Cleans up listeners when client disconnects
+ */
 wss.on('connection', (ws) => {
-  console.log('Client connected');
+  console.log('✅ Client connected');
 
   if (parser) {
+    // Create data handler for this client connection
     const onData = (data) => {
       try {
         const gpsData = parseGPSData(data);
         if (gpsData) {
-          console.log('Broadcasting to WebSocket client:', JSON.stringify(gpsData));
+          console.log('📡 Broadcasting to WebSocket client:', JSON.stringify(gpsData));
           ws.send(JSON.stringify(gpsData));
         }
       } catch (error) {
-        console.error('Error parsing GPS data:', error);
+        console.error('❌ Error parsing GPS data:', error);
       }
     };
 
+    // Attach data listener to serial parser
     parser.on('data', onData);
 
+    // Clean up listener when client disconnects
     ws.on('close', () => {
+      console.log('🔌 Client disconnected');
       parser.removeListener('data', onData);
     });
   } else {
-    // If no real parser, client will receive mock data from the shared mockInterval
-    console.log('No serial parser; using mock GPS data broadcaster');
+    // If no real parser, inform client that we're using mock GPS data
+    console.log('ℹ️  No serial parser; using mock GPS data broadcaster');
     ws.send(JSON.stringify({ message: 'No serial device; sending mock GPS data' }));
   }
 });
 
-// Helper: convert NMEA lat/lon (ddmm.mmmm) + hemisphere to decimal degrees
+/**
+ * ============================================================================
+ * NMEA COORDINATE CONVERTER
+ * ============================================================================
+ * Converts NMEA-0183 latitude/longitude format to decimal degrees
+ * 
+ * NMEA Format: ddmm.mmmm where dd=degrees, mm=minutes, .mmmm=decimal minutes
+ * Examples:
+ * - 4807.038 N = 48° 07.038' North = 48.11730° decimal
+ * - 01131.000 E = 11° 31.000' East = 11.51667° decimal
+ * 
+ * Parameters:
+ * - coord: NMEA coordinate string (e.g., "4807.038")
+ * - hemi: Hemisphere indicator ('N'=North, 'S'=South, 'E'=East, 'W'=West)
+ * 
+ * Returns: Decimal degrees as number (negative if S or W)
+ */
 function nmeaToDecimal(coord, hemi) {
   if (!coord) return null;
-  // coord as string like 4807.038 or 1234.5678
+  
   const f = parseFloat(coord);
   if (isNaN(f)) return null;
+  
+  // Extract degrees (first 2-3 digits)
   const deg = Math.floor(f / 100);
+  // Extract minutes (remaining digits after degrees)
   const min = f - deg * 100;
+  // Convert to decimal: degrees + (minutes/60)
   let dec = deg + (min / 60);
+  
+  // Apply hemisphere: S=South (-), W=West (-)
   if (hemi === 'S' || hemi === 'W') dec = -dec;
+  
   return parseFloat(dec.toFixed(6));
 }
 
-// Buffer for labeled key:value serial outputs
+// ============== GPS DATA PARSING ==============
+// Buffer for labeled (key:value) GPS data from Arduino
 let labeledBuffer = {};
-let labeledLastBroadcast = 0; // timestamp of last broadcast
-const LABELED_BROADCAST_INTERVAL = 2000; // broadcast every 2s if we have lat/lon
-let lastBroadcastedStr = null;
+let labeledLastBroadcast = 0;        // Timestamp of last labeled broadcast
+const LABELED_BROADCAST_INTERVAL = 2000; // Broadcast labeled data every 2 seconds
+let lastBroadcastedStr = null;      // Last broadcast string to detect duplicates
 
+/**
+ * ============================================================================
+ * GPS DATA PARSER
+ * ============================================================================
+ * Parses GPS data in multiple formats:
+ * 1. NMEA sentences ($GPGGA, $GPRMC)
+ * 2. Labeled key-value format from Arduino
+ * 3. Raw lines (stored but not broadcast)
+ * 
+ * Supports:
+ * - GPGGA: Position, altitude, satellite count, HDOP
+ * - GPRMC: Position, speed, course, date
+ * - Labeled: Key: Value format (e.g., "Latitude: 17.385")
+ * 
+ * Returns: Parsed GPS object or null if invalid/raw data
+ */
 function parseGPSData(rawData) {
   if (!rawData) return null;
   const s = rawData.trim();
   if (s.length === 0) return null;
 
-  // Skip duplicate consecutive lines from serial port
+  // Skip duplicate consecutive lines (common with serial data)
   if (s === lastRawInput) {
     return null;
   }
@@ -349,14 +443,26 @@ function parseGPSData(rawData) {
 
   console.log(`[PARSING] Raw input: "${s}"`);
 
-  // If NMEA sentence
+  // ==================== NMEA SENTENCE PARSING ====================
   if (s.startsWith('$')) {
     const parts = s.split(',');
     const type = parts[0].slice(1);
 
-    // GPGGA - Global Positioning System Fix Data
+    /**
+     * GPGGA - Global Positioning System Fix Data
+     * Format: $GPGGA,hhmmss,ddmm.mmmm,a,dddmm.mmmm,a,x,xx,x.x,x.x,M,x.x,M,,*hh
+     * Example: $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47
+     * 
+     * Fields:
+     * 1: Time (hhmmss)
+     * 2-3: Latitude and hemisphere
+     * 4-5: Longitude and hemisphere
+     * 6: Fix quality (0=invalid, 1=GPS fix, 2=DGPS fix)
+     * 7: Satellite count
+     * 8: HDOP (Horizontal dilution of precision)
+     * 9: Altitude above mean sea level
+     */
     if (type === 'GPGGA' || type.endsWith('GGA')) {
-      // Example: $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47
       const time = parts[1];
       const lat = nmeaToDecimal(parts[2], parts[3]);
       const lon = nmeaToDecimal(parts[4], parts[5]);
@@ -365,7 +471,7 @@ function parseGPSData(rawData) {
       const hdop = parseFloat(parts[8]) || null;
       const altitude = parseFloat(parts[9]) || null;
 
-      // Format time to HH:MM:SS if possible
+      // Format time from hhmmss to HH:MM:SS
       let hhmmss = '';
       if (time && time.length >= 6) {
         hhmmss = `${time.slice(0,2)}:${time.slice(2,4)}:${time.slice(4,6)}`;
@@ -561,34 +667,7 @@ function parseGPSData(rawData) {
 
 // Function to setup serial parser with event listeners
 function setupSerialParser(newParser) {
-  if (!newParser) return;
-  
-  // Remove old listeners if they exist
-  if (parser) {
-    parser.removeAllListeners('data');
-  }
-  
-  // Set the new parser
-  parser = newParser;
-  
-  // Add data listener for broadcasting
-  parser.on('data', (data) => {
-    try {
-      const gpsData = parseGPSData(data);
-      broadcastToClients(gpsData);
-    } catch (err) {
-      console.error('Error parsing/broadcasting GPS data:', err);
-    }
-  });
-  
-  // Clear mock interval if it was running
-  if (mockInterval) {
-    clearInterval(mockInterval);
-    mockInterval = null;
-  }
-}
-
-server.listen(8080, () => {
+erver.listen(8080, () => {
   console.log(`Server started on port 8080 (pid=${process.pid})`);
 });
 
